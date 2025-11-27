@@ -2,6 +2,7 @@ import copy
 import math
 import os
 from collections import defaultdict
+from itertools import combinations
 
 # Set environment variable to disable ultralytics verbose logging
 os.environ['YOLO_VERBOSE'] = "False"
@@ -746,6 +747,8 @@ def process_raw_data(
         size_std_thresh: int = 4, speed_std_thresh: int = 5, size_speed_infill_frames: int = 20,
         # Stage 6
         final_infill_frames: int = 20,
+        # Overlaps
+        overlap_gap_fill: int = 20, overlap_min_duration: int = 100,
         # Output
         out_dir: str | None = None
 ) -> tuple[dict, dict]:
@@ -800,6 +803,8 @@ def process_raw_data(
         size_speed_infill_frames: How many frames to infill based on size/speed std outliers.
         final_infill_frames: How many frames to infill right at the end. This can help to join
             segments.
+        overlap_gap_fill: Gap fill for detecting overlapping tracks.
+        overlap_min_duration: Minimum duration for two tracks to overlap to be deemed overlapping.
         out_dir: If given, folder to store output visualisations showing problematic frames
             per-object.
 
@@ -817,13 +822,18 @@ def process_raw_data(
         for obj_id, obj_data in objects.items():
             speed = obj_data.get('speed (mm/second)', None)
             size = obj_data.get('polygon size (mm2)', None)
+            centroid_x = obj_data.get('centroid x', None)
+            centroid_y = obj_data.get('centroid y', None)
             if speed is not None and size is not None:
-                obj_measures.setdefault(obj_id, []).append((frame, speed, size))
+                obj_measures.setdefault(obj_id, []).append((frame, speed, size, centroid_x, centroid_y))
+
+    # Set store for outlier (bad) frame indices per-object
+    bad_object_frame_indices = {}
 
     # Detect outliers for each object
     for obj_id, obj_measure in obj_measures.items():
         # Extract data for this object
-        frames, speed_data, size_data = zip(*obj_measure)  # Separate frames, speeds, and sizes
+        frames, speed_data, size_data, _, _ = zip(*obj_measure)  # Separate frames, speeds, and sizes
         speed_data, size_data = np.array(speed_data), np.array(size_data)
 
         # Store for ALL detected outlier indices
@@ -935,31 +945,84 @@ def process_raw_data(
         composite_outlier_indices = fill_gaps_in_array(
             composite_outlier_indices, max_gap=final_infill_frames, max_idx=max_index)
 
-        # Visualise outliers
-        # TODO: Remove to after overlap detection
+        # Store these bad frame indices for the object
+        bad_object_frame_indices[obj_id] = composite_outlier_indices
+
+    # Detect overlapping areas for each object
+    all_centroid_data, all_obj_ids = [], []
+    for obj_id, obj_measure in obj_measures.items():
+        _, _, _, centroid_x, centroid_y = zip(*obj_measure)
+        centroid = [(x, y) for x, y in zip(centroid_x, centroid_y)]
+        all_centroid_data.append(centroid)
+        all_obj_ids.append(obj_id)
+    overlaps = detect_overlapping_data(
+        all_centroid_data, small_gap_fill=overlap_gap_fill,
+        min_overlap_duration=overlap_min_duration)
+    # Update bad_object_frame_indices based on detected overlaps
+    for overlap_info in overlaps:
+        # Extract info about this overlap
+        idx_a, idx_b, overlap_segments = overlap_info
+        obj_id_a, obj_id_b = all_obj_ids[idx_a], all_obj_ids[idx_b]
+
+        # For each overlap segment, determine which is the likely 'correct'/'outlier' one
+        # Flag frames as outliers for the object with the most intersecting outlier frames
+        for overlap_segment in overlap_segments:
+            # Find intersections for each object with outliers and overlap
+            current_overlap_indices = contiguous_segments_to_indices([overlap_segment])
+            overlap_a_outlier_indices = get_indices_intersection(
+                bad_object_frame_indices[obj_id_a],
+                current_overlap_indices,
+            )
+            overlap_b_outlier_indices = get_indices_intersection(
+                bad_object_frame_indices[obj_id_b],
+                current_overlap_indices,
+            )
+
+            # Set this segment as an outlier for the case with more overlap frames as outliers
+            if len(overlap_a_outlier_indices) < len(overlap_b_outlier_indices):
+                bad_object_frame_indices[obj_id_b] = np.union1d(bad_object_frame_indices[obj_id_b], current_overlap_indices)
+            else:
+                bad_object_frame_indices[obj_id_a] = np.union1d(bad_object_frame_indices[obj_id_a], current_overlap_indices)
+
+    # Visualise the outliers
+    for obj_id, obj_measure in obj_measures.items():
+        frames, size_data, speed_data, _, _ = zip(*obj_measure)
+        size_diff_data = np.diff(size_data, prepend=size_data[0] - 0.1)
+        speed_diff_data = np.diff(speed_data, prepend=speed_data[0] - 0.1)
+
+        # Get outlier indices for this object
+        object_outlier_frame_indices = bad_object_frame_indices[obj_id]
+
         os.makedirs(out_dir, exist_ok=True)
-        outlier_segments = get_contiguous_segments(composite_outlier_indices)
+        outlier_segments = get_contiguous_segments(object_outlier_frame_indices)
         v_lines = get_flat_segment_start_end_indices(outlier_segments)
         plot_multiple_data([
             dict(y=size_data, title=f'Size w/ Outliers', x_label='Frame', y_label='Size (mm^2)',
-                 point_idxs=composite_outlier_indices, v_lines=v_lines, v_spans=outlier_segments,
+                 point_idxs=object_outlier_frame_indices, v_lines=v_lines, v_spans=outlier_segments,
                  v_lines_spans_colour='red', scatter_size=1, point_idx_size=2, bottom_y_lim=0),
             dict(y=speed_data, title=f'Speed w/ Outliers', x_label='Frame', y_label='Speed (mm/s)',
-                 point_idxs=composite_outlier_indices, v_lines=v_lines, v_spans=outlier_segments,
+                 point_idxs=object_outlier_frame_indices, v_lines=v_lines, v_spans=outlier_segments,
                  v_lines_spans_colour='red', scatter_size=1, point_idx_size=2, bottom_y_lim=0),
-            dict(y=size_data, title=f'Size Diff w/ Outliers', x_label='Frame', y_label='Size (mm^s)',
-                 point_idxs=composite_outlier_indices, v_lines=v_lines, v_spans=outlier_segments,
+            dict(y=size_diff_data, title=f'Size Diff w/ Outliers', x_label='Frame', y_label='Size (mm^s)',
+                 point_idxs=object_outlier_frame_indices, v_lines=v_lines, v_spans=outlier_segments,
                  v_lines_spans_colour='red', scatter_size=1, point_idx_size=2, bottom_y_lim=None),
-            dict(y=speed_data, title=f'Speed Diff w/ Outliers', x_label='Frame', y_label='Speed (mm/s)',
-                 point_idxs=composite_outlier_indices, v_lines=v_lines, v_spans=outlier_segments,
+            dict(y=speed_diff_data, title=f'Speed Diff w/ Outliers', x_label='Frame', y_label='Speed (mm/s)',
+                 point_idxs=object_outlier_frame_indices, v_lines=v_lines, v_spans=outlier_segments,
                  v_lines_spans_colour='red', scatter_size=1, point_idx_size=2, bottom_y_lim=None),
-        ], fig_title=f'Outliers. {len(composite_outlier_indices)} frames.',
-        sub_title=f'{len(composite_outlier_indices)} outlier frames. {len(outlier_segments)} segments.',
+        ], fig_title=f'Outliers. {len(object_outlier_frame_indices)} frames.',
+        sub_title=f'{len(object_outlier_frame_indices)} outlier frames. {len(outlier_segments)} segments.',
         out_file=os.path.join(out_dir, f'{obj_id}.jpg'))
 
+    # Store final set of good/bad frames per-object
+    for obj_id, obj_measure in obj_measures.items():
+        frames, _, speed_data, _, _ = zip(*obj_measure)
+
+        # Get outlier indices for this object
+        object_outlier_frame_indices = bad_object_frame_indices[obj_id]
+
         # Separate good and bad data
-        good_frames = [frames[i] for i in range(len(speed_data)) if i not in composite_outlier_indices]
-        bad_frames = [frames[i] for i in composite_outlier_indices]
+        good_frames = [frames[i] for i in range(len(speed_data)) if i not in object_outlier_frame_indices]
+        bad_frames = [frames[i] for i in object_outlier_frame_indices]
 
         # Populate good_data
         for frame in good_frames:
@@ -968,8 +1031,6 @@ def process_raw_data(
         # Populate bad_data
         for frame in bad_frames:
             bad_data.setdefault(frame, {}).setdefault(obj_id, {}).update(data[frame][obj_id])
-
-    # TODO: Overlap logic
 
     return good_data, bad_data
 
@@ -1212,6 +1273,78 @@ def detect_std_outliers(data, std_threshold, mean=None, std=None):
     return outliers, outlier_indices, mean, std
 
 
+# #################
+# Overlap Detection
+# #################
+def detect_overlapping_data(all_data, small_gap_fill=20, min_overlap_duration=100):
+    """Detects whether any two sets of data overlap, and where that overlap occurs.
+
+    Overlap only triggered if it meets the min_overlap_duration (e.g. for 100 indices).
+
+    Expects all data to be a list of arrays/lists. The length of each sublist should be the same.
+
+    Returns a list of tuples containing for any detected overlaps:
+        (i, j, [(start_idx, end_idx), ...])
+    Where:
+        i: Is the index of the first track
+        j: Is the index of the second track
+        [(), ...]: Are the indices where overlaps were detected
+    """
+    # Ensure all data are numpy arrays
+    all_data = [np.array(dat) for dat in all_data]
+
+    # Store of final detected overlaps
+    overlaps = []
+
+    # Determine how many sets of data we have, and the length of each
+    num_datasets = len(all_data)
+    data_len = len(all_data[0])
+
+    # Compare all pairs of tracks
+    for i, j in combinations(range(num_datasets), 2):
+        # i, j take on indices into all_data to compare
+        dat_a, dat_b = all_data[i], all_data[j]
+
+        # Ensure shapes match
+        if dat_a.shape != dat_b.shape:
+            raise RuntimeError(f'Data {i} and {j} have different shapes: {dat_a.shape} != {dat_b.shape}')
+
+        # Create an array where points are equal. Work with (N,) or (N, x) dimensional arrays
+        if dat_a.ndim == 1:
+            eq = dat_a == dat_b
+        else:
+            eq = np.all(dat_a == dat_b, axis=1)
+
+        # Find consecutive stretches of True
+        if np.any(eq):
+            # Pad eq with False at each end to detect overlaps at the start (Trues)
+            padded = np.r_[False, eq, False]
+
+            # Find where the array changes from False -> True/True -> False
+            diff = np.diff(padded.astype(int))
+
+            # Extract starts/ends of overlaps based on where signal changes sign
+            starts = np.where(diff == 1)[0]
+            ends = np.where(diff == -1)[0]
+
+            # Convert ends to be inclusive
+            ends -= 1
+
+            # Construct regions of (start, end)
+            valid_overlap_segments = [(s, e) for s, e in zip(starts, ends)]
+
+            # Fill gaps in this signal (to avoid slight noise)
+            valid_overlap_indices = contiguous_segments_to_indices(valid_overlap_segments)
+            valid_overlap_indices = fill_gaps_in_array(valid_overlap_indices, max_gap=small_gap_fill, max_idx=data_len-1)
+            valid_overlap_segments = get_contiguous_segments(valid_overlap_indices)
+
+            # Filter remaining segments based on meeting the length criteria
+            valid_overlap_segments = [seg for seg in valid_overlap_segments if (seg[1] - seg[0] + 1) >= min_overlap_duration]
+            if valid_overlap_segments:
+                overlaps.append((i, j, valid_overlap_segments))
+    return overlaps
+
+
 # ###############
 # Array Utilities
 # ###############
@@ -1278,6 +1411,14 @@ def contiguous_segments_to_indices(segments):
     for s, e in segments:
         out.extend(range(s, e + 1))
     return np.array(out, dtype=int)
+
+
+def get_indices_intersection(indices_a, indices_b):
+    """Returns a list of indices that intersect both A and B.
+
+    Done by finding the intersection between both.
+    """
+    return np.intersect1d(indices_a, indices_b)
 
 
 def fill_gaps_in_array(indices, max_gap=2, min_idx=0, max_idx=None):
