@@ -986,7 +986,7 @@ def process_raw_data(
 
     # Visualise the outliers
     for obj_id, obj_measure in obj_measures.items():
-        frames, size_data, speed_data, _, _ = zip(*obj_measure)
+        frames, speed_data, size_data, _, _ = zip(*obj_measure)
         size_diff_data = np.diff(size_data, prepend=size_data[0] - 0.1)
         speed_diff_data = np.diff(speed_data, prepend=speed_data[0] - 0.1)
 
