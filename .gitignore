@@ -8,3 +8,7 @@ build/*
 _C.*
 outputs/*
 checkpoints/*.pt
+
+# IDE files.
+.idea/
+.vscode/

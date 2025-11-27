@@ -70,7 +70,7 @@ def get_larva_detections(video_path, detection_model, steps=30, num_larvae=5):
     return result, boxes_xyxy, frame_index
 
 
-def extract_frames_ffmpeg(video_path, output_dir, quality=2, start_number=0, file_pattern='%05d.jpg'):
+def extract_frames_ffmpeg(video_path, output_dir, quality=2, start_number=0, fps=None, file_pattern='%05d.jpg'):
     """
     Uses ffmpeg-python to extract frames from a video and save as images.
 
@@ -79,6 +79,7 @@ def extract_frames_ffmpeg(video_path, output_dir, quality=2, start_number=0, fil
         output_dir (str): Directory to save the extracted frames.
         quality (int): Quality level for the output images (lower is better quality).
         start_number (int): Starting number for the output image filenames.
+        fps (int/None): The framerate to extract frames at.
         file_pattern (str): Pattern for naming the output images (default: '%05d.jpg').
     
     Returns:
@@ -91,9 +92,12 @@ def extract_frames_ffmpeg(video_path, output_dir, quality=2, start_number=0, fil
 
     # Construct output file path pattern
     output_path = f'{output_dir}/{file_pattern}'
-    
+
     # Use ffmpeg to extract frames
-    ffmpeg.input(video_path).output(
+    stream = ffmpeg.input(video_path)
+    if fps is not None:
+        stream = stream.filter('fps', fps=fps, round='up')
+    stream.output(
         output_path, 
         q=quality,  # Quality for the frames
         start_number=start_number  # Start number for frame file names
