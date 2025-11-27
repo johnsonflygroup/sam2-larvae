@@ -649,21 +649,42 @@ def draw_track(out_dir, paths_dir, video_segments, h, w):
         cv2.imwrite(os.path.join(out_dir, paths_dir, f'{obj_id}.png'), canvas)
 
 
+def sample_frames(num_frames, src_fps, target_fps):
+    """Samples a subset of frames based on source and target FPS of a video
+    """
+    if target_fps == src_fps:
+        return list(range(num_frames))
+
+    step = src_fps / target_fps
+    return sorted(set(map(int, np.arange(0, num_frames, step))))
+
+
 def draw_on_video(video_path, out_dir, out_video_name, video_segments, fps, h, w, duration_of_tracking_path=10):
+    """fps represents the FPS that all predictions (video segments) are generated at.
+    """
     # Dictionary to store tracking history with default empty lists
     track_history = defaultdict(lambda: [])
     colors_cache = {}  # Cache colors to avoid recomputation
 
     # Open the video file
     cap = cv2.VideoCapture(video_path)
+    cap_fps = cap.get(cv2.CAP_PROP_FPS)
+
+    if fps > cap_fps:
+        print(f'[WARNING]: Untested when FPS is greater than the original video.')
 
     # Initialize video writer to save the output video with the specified properties
     out_video_path = os.path.join(out_dir, out_video_name)
     out = cv2.VideoWriter(out_video_path, cv2.VideoWriter_fourcc(*"MP4V"), fps, (w, h))
 
-    # Get total frames
+    # Get total frames of video
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+    # Get which frames should be sampled
+    frame_indices_to_sample = sample_frames(frame_count, cap_fps, fps)
+
+    # Index of the frame that has been sampled
+    frame_index_target_fps = 0
     for frame_index in tqdm(range(frame_count), desc='Generating video'):
         # Read frame (automatically advances, so no need for `cap.set`)
         ret, frame = cap.read()
@@ -671,10 +692,14 @@ def draw_on_video(video_path, out_dir, out_video_name, video_segments, fps, h, w
         if not ret:
             break
 
+        # Only proceed if it's a frame that should be sampled
+        if frame_index not in frame_indices_to_sample:
+            continue
+
         # Create or reuse annotator for the frame
         annotator = Annotator(frame, line_width=2)
 
-        results = video_segments.get(frame_index, {})  # Get current frame results
+        results = video_segments.get(frame_index_target_fps, {})  # Get current frame results
 
         for track_id, data in results.items():
             if track_id not in colors_cache:
@@ -693,6 +718,9 @@ def draw_on_video(video_path, out_dir, out_video_name, video_segments, fps, h, w
 
         # Write the annotated frame to the output video
         out.write(frame)
+
+        # Increment the frame index at the target FPS (i.e. the data sampled)
+        frame_index_target_fps += 1
 
     # Release the video writer and capture objects, and close all OpenCV windows
     out.release()
